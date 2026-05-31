@@ -1,436 +1,901 @@
 // ==UserScript==
-// @name        Location Guard
-// @description A UserScript that hide/spoof your geographic location from websites.
-// @namespace   https://skk.moe
-// @run-at      document-end
+// @name        Mobile Location Privacy Guard
+// @description Spoofs or fuzzes navigator.geolocation for mobile browsers. Does not hide IP, VPN, timezone, fingerprint, accounts, or network-based location.
+// @namespace   https://github.com/JellyFangThunderBucket/Geoloconationals
+// @run-at      document-start
 // @match       *://*/*
-// @updateURL   https://unpkg.com/location-guard@latest/dist/location-guard-ng.meta.js
-// @downloadURL https://unpkg.com/location-guard@latest/dist/location-guard-ng.user.js
-// @version     0.2.2
-// @author      Sukka <https://skk.moe>
+// @version     1.0.0
+// @author      Sukka <https://skk.moe>; privacy hardening by contributors
 // @grant       unsafeWindow
 // @grant       GM_getValue
 // @grant       GM_setValue
+// @grant       GM_registerMenuCommand
 // @grant       GM.getValue
 // @grant       GM.setValue
-// @grant       GM_deleteValue
-// @grant       GM.deleteValue
 // @grant       GM.registerMenuCommand
-// @grant       GM_addValueChangeListener
-// @grant       GM_removeValueChangeListener
-// @grant       GM.addValueChangeListener
-// @grant       GM.removeValueChangeListener
 // ==/UserScript==
 
-(function(){'use strict';const DEFAULT_VALUE = {
-    defaultLevel: 'fixed',
-    paused: false,
-    cachedPos: {},
-    fixedPos: {
-        latitude: -4.448784,
-        longitude: -171.24832
-    },
-    updateAccuracy: true,
-    epsilon: 2,
-    levels: {
-        low: {
-            radius: 200,
-            cacheTime: 10
-        },
-        medium: {
-            radius: 500,
-            cacheTime: 30
-        },
-        high: {
-            radius: 2000,
-            cacheTime: 60
-        }
-    }
-};
-function getStoredValueAsync(key, providedDefaultValue) {
-    return GM.getValue(key, providedDefaultValue ?? DEFAULT_VALUE[key]);
-}
-function setStoredValueAsync(key, value) {
-    return GM.setValue(key, value);
-}// Planar Laplace mechanism, based on Marco's demo
-//
-// This class just implements the mechanism, does no budget management or
-// selection of epsilon
-//
-// constructor
-const PlanarLaplace = {
-    /** convert an angle in radians to degrees and viceversa */ rad_of_deg (ang) {
-        return ang * Math.PI / 180;
-    },
-    deg_of_rad (ang) {
-        return ang * 180 / Math.PI;
-    },
+(function () {
+    'use strict';
+
     /**
-   * Mercator projection
-   * https://wiki.openstreetmap.org/wiki/Mercator
-   * https://en.wikipedia.org/wiki/Mercator_projection
-   *
-   * getLatLon and getCartesianPosition are inverse functions
-   * They are used to transfer { x: ..., y: ... } and { latitude: ..., longitude: ... } into one another
-   */ getLatLon ({ x, y }) {
-        const rLon = x / PlanarLaplace.earth_radius;
-        const rLat = 2 * Math.atan(Math.exp(y / PlanarLaplace.earth_radius)) - Math.PI / 2;
-        // convert to degrees
-        return {
-            latitude: PlanarLaplace.deg_of_rad(rLat),
-            longitude: PlanarLaplace.deg_of_rad(rLon)
-        };
-    },
-    getCartesian ({ longitude, latitude }) {
-        // latitude and longitude are converted in radiants
-        return {
-            x: PlanarLaplace.earth_radius * PlanarLaplace.rad_of_deg(longitude),
-            y: PlanarLaplace.earth_radius * Math.log(Math.tan(Math.PI / 4 + PlanarLaplace.rad_of_deg(latitude) / 2))
-        };
-    },
-    /** LamberW function on branch -1 (http://en.wikipedia.org/wiki/Lambert_W_function) */ LambertW (x) {
-        // min_diff decides when the while loop should stop
-        const min_diff = 1e-10;
-        if (x === -1 / Math.E) {
-            return -1;
+     * IMPORTANT PRIVACY LIMITATION:
+     * This userscript only protects the JavaScript Geolocation API surfaces that
+     * pages commonly call: navigator.geolocation and, when possible,
+     * navigator.permissions.query({ name: 'geolocation' }). It does NOT hide or
+     * change your IP address, VPN/proxy status, carrier/Wi-Fi network location,
+     * timezone, locale, browser fingerprint, Apple/Google/Microsoft account
+     * signals, cookies, local storage, or server-side location inferences. Use a
+     * reputable VPN/Tor-style tool and browser privacy controls if you need to
+     * protect those other signals.
+     */
+
+    const SCRIPT_NAME = 'Mobile Location Privacy Guard';
+    const STORAGE_KEY = 'mobileLocationPrivacyGuard.config.v1';
+    const EARTH_RADIUS_METERS = 6378137;
+    const DEFAULT_WATCH_INTERVAL_MS = 5000;
+    const MIN_WATCH_INTERVAL_MS = 1000;
+
+    const PRESETS = {
+        pacific: {
+            label: 'Pacific Ocean',
+            latitude: -4.448784,
+            longitude: -171.24832,
+            accuracy: 65,
+            altitude: null,
+            altitudeAccuracy: null,
+            heading: null,
+            speed: null
+        },
+        newYork: {
+            label: 'New York',
+            latitude: 40.758896,
+            longitude: -73.98513,
+            accuracy: 35,
+            altitude: 15,
+            altitudeAccuracy: 18,
+            heading: null,
+            speed: 0
+        },
+        london: {
+            label: 'London',
+            latitude: 51.507351,
+            longitude: -0.127758,
+            accuracy: 35,
+            altitude: 11,
+            altitudeAccuracy: 18,
+            heading: null,
+            speed: 0
+        },
+        tokyo: {
+            label: 'Tokyo',
+            latitude: 35.681236,
+            longitude: 139.767125,
+            accuracy: 35,
+            altitude: 16,
+            altitudeAccuracy: 18,
+            heading: null,
+            speed: 0
+        },
+        custom: {
+            label: 'Custom latitude/longitude',
+            latitude: -4.448784,
+            longitude: -171.24832,
+            accuracy: 50,
+            altitude: null,
+            altitudeAccuracy: null,
+            heading: null,
+            speed: null
         }
-        if (x < 0 && x > -1 / Math.E) {
-            let q = Math.log(-x);
-            let p = 1;
-            while(Math.abs(p - q) > min_diff){
-                p = (q * q + x / Math.exp(q)) / (q + 1);
-                q = (p * p + x / Math.exp(p)) / (p + 1);
-            }
-            // This line decides the precision of the float number that would be returned
-            return Math.round(1000000 * q) / 1000000;
-        }
-        if (x === 0) {
-            return 0;
-        }
-        // TODO why do you need this if branch?
-        return 0;
-    },
-    /** This is the inverse cumulative polar laplacian distribution function. */ inverseCumulativeGamma (epsilon, z) {
-        const x = (z - 1) / Math.E;
-        return -(PlanarLaplace.LambertW(x) + 1) / epsilon;
-    },
-    /**
-   * returns alpha such that the noisy pos is within alpha from the real pos with
-   * probability at least delta
-   * (comes directly from the inverse cumulative of the gamma distribution)
-   */ alphaDeltaAccuracy (epsilon, delta) {
-        return PlanarLaplace.inverseCumulativeGamma(epsilon, delta);
-    },
-    // returns the average distance between the real and the noisy pos
-    //
-    expectedError (epsilon) {
-        return 2 / epsilon;
-    },
-    addPolarNoise (epsilon, pos) {
-        // random number in [0, 2*PI)
-        const theta = Math.random() * Math.PI * 2;
-        // random variable in [0,1)
-        const z = Math.random();
-        const r = PlanarLaplace.inverseCumulativeGamma(epsilon, z);
-        return PlanarLaplace.addVectorToPos(pos, r, theta);
-    },
-    addPolarNoiseCartesian (epsilon, pos) {
-        let x, y;
-        if ('latitude' in pos) {
-            const tmp = PlanarLaplace.getCartesian(pos);
-            x = tmp.x;
-            y = tmp.y;
-        } else {
-            x = pos.x;
-            y = pos.y;
-        }
-        // random number in [0, 2*PI)
-        const theta = Math.random() * Math.PI * 2;
-        // random variable in [0,1)
-        const z = Math.random();
-        const r = PlanarLaplace.inverseCumulativeGamma(epsilon, z);
-        return PlanarLaplace.getLatLon({
-            x: x + r * Math.cos(theta),
-            y: y + r * Math.sin(theta)
-        });
-    },
-    /** http://www.movable-type.co.uk/scripts/latlong.html */ addVectorToPos ({ latitude, longitude }, distance, angle) {
-        const ang_distance = distance / PlanarLaplace.earth_radius;
-        const lat1 = PlanarLaplace.rad_of_deg(latitude);
-        const lon1 = PlanarLaplace.rad_of_deg(longitude);
-        const lat2 = Math.asin(Math.sin(lat1) * Math.cos(ang_distance) + Math.cos(lat1) * Math.sin(ang_distance) * Math.cos(angle));
-        let lon2 = lon1 + Math.atan2(Math.sin(angle) * Math.sin(ang_distance) * Math.cos(lat1), Math.cos(ang_distance) - Math.sin(lat1) * Math.sin(lat2));
-        // eslint-disable-next-line @stylistic/js/no-mixed-operators -- copy other's formula
-        lon2 = (lon2 + 3 * Math.PI) % (2 * Math.PI) - Math.PI; // normalise to -180..+180
-        return {
-            latitude: PlanarLaplace.deg_of_rad(lat2),
-            longitude: PlanarLaplace.deg_of_rad(lon2)
-        };
-    },
-    /** This function generates the position of a point with Laplacian noise */ addNoise (epsilon, pos) {
-        // TODO: use latlon.js
-        return PlanarLaplace.addPolarNoise(epsilon, pos);
-    },
-    earth_radius: 6378137 // const, in meters
-};function klona(x) {
-	if (typeof x !== 'object') return x;
+    };
 
-	var k, tmp, str=Object.prototype.toString.call(x);
+    const DEFAULT_CONFIG = {
+        mode: 'fixed',
+        paused: false,
+        preset: 'pacific',
+        custom: {
+            latitude: PRESETS.custom.latitude,
+            longitude: PRESETS.custom.longitude,
+            accuracy: PRESETS.custom.accuracy,
+            altitude: PRESETS.custom.altitude,
+            altitudeAccuracy: PRESETS.custom.altitudeAccuracy,
+            heading: PRESETS.custom.heading,
+            speed: PRESETS.custom.speed
+        },
+        fuzzy: {
+            radiusMeters: 1500,
+            cacheMinutes: 15
+        },
+        permissionState: 'granted',
+        debug: false,
+        cachedFake: null
+    };
 
-	if (str === '[object Object]') {
-		if (x.constructor !== Object && typeof x.constructor === 'function') {
-			tmp = new x.constructor();
-			for (k in x) {
-				if (x.hasOwnProperty(k) && tmp[k] !== x[k]) {
-					tmp[k] = klona(x[k]);
-				}
-			}
-		} else {
-			tmp = {}; // null
-			for (k in x) {
-				if (k === '__proto__') {
-					Object.defineProperty(tmp, k, {
-						value: klona(x[k]),
-						configurable: true,
-						enumerable: true,
-						writable: true,
-					});
-				} else {
-					tmp[k] = klona(x[k]);
-				}
-			}
-		}
-		return tmp;
-	}
+    const pageWindow = typeof unsafeWindow === 'object' && unsafeWindow ? unsafeWindow : window;
+    const nativeNavigator = pageWindow.navigator || navigator;
+    const nativeGeolocation = nativeNavigator.geolocation;
+    const nativePermissions = nativeNavigator.permissions;
+    const nativeGetCurrentPosition = nativeGeolocation && nativeGeolocation.getCurrentPosition;
+    const nativeWatchPosition = nativeGeolocation && nativeGeolocation.watchPosition;
+    const nativeClearWatch = nativeGeolocation && nativeGeolocation.clearWatch;
+    const nativePermissionsQuery = nativePermissions && nativePermissions.query;
 
-	if (str === '[object Array]') {
-		k = x.length;
-		for (tmp=Array(k); k--;) {
-			tmp[k] = klona(x[k]);
-		}
-		return tmp;
-	}
+    const gmApi = typeof GM === 'object' && GM !== null ? GM : {};
+    const gmGetValue = typeof gmApi.getValue === 'function'
+        ? gmApi.getValue.bind(gmApi)
+        : (typeof GM_getValue === 'function' ? GM_getValue : null);
+    const gmSetValue = typeof gmApi.setValue === 'function'
+        ? gmApi.setValue.bind(gmApi)
+        : (typeof GM_setValue === 'function' ? GM_setValue : null);
+    const gmRegisterMenuCommand = typeof gmApi.registerMenuCommand === 'function'
+        ? gmApi.registerMenuCommand.bind(gmApi)
+        : (typeof GM_registerMenuCommand === 'function' ? GM_registerMenuCommand : null);
 
-	if (str === '[object Date]') {
-		return new Date(+x);
-	}
+    let configPromise = null;
+    const virtualWatchers = new Map();
+    let nextWatchId = 1;
+    let panel = null;
+    let debugEnabled = false;
 
-	if (str === '[object RegExp]') {
-		tmp = new RegExp(x.source, x.flags);
-		tmp.lastIndex = x.lastIndex;
-		return tmp;
-	}
-
-	return x;
-}const pattern = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i;
-let isMobile = null;
-const isMobileDevice = ()=>{
-    if (isMobile !== null) return isMobile;
-    isMobile = pattern.test(window.navigator.userAgent);
-    return isMobile;
-};
-function randomInt(from, to) {
-    return Math.floor(Math.random() * (to - from + 1)) + from;
-}// eslint-disable-next-line @typescript-eslint/unbound-method -- cache original function and will be called with proper this
-const watchPosition = navigator.geolocation.watchPosition;
-// eslint-disable-next-line @typescript-eslint/unbound-method -- cache original function and will be called with proper this
-const getCurrentPosition = navigator.geolocation.getCurrentPosition;
-// eslint-disable-next-line @typescript-eslint/unbound-method -- cache original function and will be called with proper this
-const clearWatch = navigator.geolocation.clearWatch;
-async function callGeoCb(cb, arg, checkAllowed) {
-    if (cb && (!checkAllowed || await isWatchAllowed())) {
-        cb(arg);
+    function isPlainObject(value) {
+        return value !== null && typeof value === 'object' && !Array.isArray(value);
     }
-}
-const spoofLocation = ()=>{
-    // We replace geolocation methods with our own.
-    // getCurrentPosition will be called by the content script (not by the page)
-    // so we dont need to keep it at all.
-    navigator.geolocation.getCurrentPosition = async function(positionCb, positionOnError, options) {
-        // call getNoisyPosition on the content-script
-        // call cb1 on success, cb2 on failure
-        const res = await getNoisyPosition(options);
-        if (res.success) {
-            callGeoCb(positionCb, res.position, false);
-        } else {
-            callGeoCb(positionOnError, res.position, false);
-        }
-    // callCb(res.success ? positionCb : positionOnError, res.position, false);
-    };
-    /** store all watchPosition method's handle id */ const handlers = new Map();
-    navigator.geolocation.watchPosition = function(cb1, cb2, options) {
-        // We need to return a handler synchronously, but decide whether we'll use the real watchPosition or not
-        // asynchronously. So we create our own handler, and we'll associate it with the real one later.
-        const handler = Math.floor(Math.random() * 10000);
-        (async ()=>{
-            if (await isWatchAllowed()) {
-                // We're allowed to call the real watchPosition (note: remember the handler)
-                handlers.set(handler, watchPosition.apply(navigator.geolocation, [
-                    (position)=>callGeoCb(cb1, position, true),
-                    (error)=>callGeoCb(cb2, error, true),
-                    options
-                ]));
-            } else {
-                // Not allowed, we don't install a real watch, just return the position once
-                this.getCurrentPosition(cb1, cb2, options);
-            }
-        })();
-        return handler;
-    };
-    navigator.geolocation.clearWatch = function(handler) {
-        if (handlers.has(handler)) {
-            clearWatch.apply(navigator.geolocation, [
-                handlers.get(handler)
-            ]);
-            handlers.delete(handler);
-        }
-    };
-};
-const inFrame = window !== window.top;
-async function isWatchAllowed() {
-    // Returns true if using the real watch is allowed. Only if paused or level == 'real'.
-    // Also don't allow in iframes (to simplify the code).
-    const level = await getStoredValueAsync('defaultLevel'); // TODO: per domain level
-    const paused = await getStoredValueAsync('paused');
-    return !inFrame && (paused || level === 'real');
-}
-async function getNoisyPosition(opt) {
-    // const domain = window.location.hostname;
-    // TODO: per domain level
-    const level = await getStoredValueAsync('defaultLevel');
-    const paused = await getStoredValueAsync('paused');
-    if (!paused && level === 'fixed') {
-        const fixedPos = await getStoredValueAsync('fixedPos');
-        const noisy = {
-            coords: {
-                latitude: fixedPos.latitude,
-                longitude: fixedPos.longitude,
-                accuracy: 10,
-                altitude: isMobileDevice() ? randomInt(10, 100) : null,
-                altitudeAccuracy: isMobileDevice() ? 10 : null,
-                heading: isMobileDevice() ? randomInt(0, 360) : null,
-                speed: null
+
+    function cloneJson(value) {
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function clamp(number, min, max) {
+        return Math.min(max, Math.max(min, number));
+    }
+
+    function toNumber(value, fallback) {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : fallback;
+    }
+
+    function normalizeLatitude(value, fallback) {
+        return clamp(toNumber(value, fallback), -90, 90);
+    }
+
+    function normalizeLongitude(value, fallback) {
+        let longitude = toNumber(value, fallback);
+        while (longitude < -180) longitude += 360;
+        while (longitude > 180) longitude -= 360;
+        return longitude;
+    }
+
+    function normalizeNonNegative(value, fallback, max) {
+        return clamp(toNumber(value, fallback), 0, max);
+    }
+
+    function normalizeNullableNumber(value, fallback, min, max) {
+        if (value === null || value === undefined || value === '') return null;
+        return clamp(toNumber(value, fallback ?? 0), min, max);
+    }
+
+    function sanitizeConfig(input) {
+        const source = isPlainObject(input) ? input : {};
+        const customSource = isPlainObject(source.custom) ? source.custom : {};
+        const fuzzySource = isPlainObject(source.fuzzy) ? source.fuzzy : {};
+        const preset = Object.prototype.hasOwnProperty.call(PRESETS, source.preset) ? source.preset : DEFAULT_CONFIG.preset;
+        const mode = ['real', 'fixed', 'fuzzy'].includes(source.mode) ? source.mode : DEFAULT_CONFIG.mode;
+        const permissionState = ['granted', 'prompt', 'denied'].includes(source.permissionState)
+            ? source.permissionState
+            : DEFAULT_CONFIG.permissionState;
+
+        return {
+            mode,
+            paused: Boolean(source.paused),
+            preset,
+            custom: {
+                latitude: normalizeLatitude(customSource.latitude, DEFAULT_CONFIG.custom.latitude),
+                longitude: normalizeLongitude(customSource.longitude, DEFAULT_CONFIG.custom.longitude),
+                accuracy: normalizeNonNegative(customSource.accuracy, DEFAULT_CONFIG.custom.accuracy, 100000),
+                altitude: normalizeNullableNumber(customSource.altitude, DEFAULT_CONFIG.custom.altitude, -500, 10000),
+                altitudeAccuracy: normalizeNullableNumber(customSource.altitudeAccuracy, DEFAULT_CONFIG.custom.altitudeAccuracy, 0, 100000),
+                heading: normalizeNullableNumber(customSource.heading, DEFAULT_CONFIG.custom.heading, 0, 360),
+                speed: normalizeNullableNumber(customSource.speed, DEFAULT_CONFIG.custom.speed, 0, 1200)
             },
+            fuzzy: {
+                radiusMeters: normalizeNonNegative(fuzzySource.radiusMeters, DEFAULT_CONFIG.fuzzy.radiusMeters, 1000000),
+                cacheMinutes: normalizeNonNegative(fuzzySource.cacheMinutes, DEFAULT_CONFIG.fuzzy.cacheMinutes, 1440)
+            },
+            permissionState,
+            debug: Boolean(source.debug),
+            cachedFake: sanitizeCachedFake(source.cachedFake)
+        };
+    }
+
+    function sanitizeCachedFake(cachedFake) {
+        if (!isPlainObject(cachedFake) || !isPlainObject(cachedFake.position)) {
+            return null;
+        }
+
+        const createdAt = toNumber(cachedFake.createdAt, 0);
+        if (!createdAt) {
+            return null;
+        }
+
+        return {
+            createdAt,
+            preset: typeof cachedFake.preset === 'string' ? cachedFake.preset : DEFAULT_CONFIG.preset,
+            radiusMeters: normalizeNonNegative(cachedFake.radiusMeters, DEFAULT_CONFIG.fuzzy.radiusMeters, 1000000),
+            position: sanitizePoint(cachedFake.position, PRESETS.pacific)
+        };
+    }
+
+    function sanitizePoint(input, fallback) {
+        const source = isPlainObject(input) ? input : {};
+        return {
+            latitude: normalizeLatitude(source.latitude, fallback.latitude),
+            longitude: normalizeLongitude(source.longitude, fallback.longitude),
+            accuracy: normalizeNonNegative(source.accuracy, fallback.accuracy ?? 50, 100000),
+            altitude: normalizeNullableNumber(source.altitude, fallback.altitude, -500, 10000),
+            altitudeAccuracy: normalizeNullableNumber(source.altitudeAccuracy, fallback.altitudeAccuracy, 0, 100000),
+            heading: normalizeNullableNumber(source.heading, fallback.heading, 0, 360),
+            speed: normalizeNullableNumber(source.speed, fallback.speed, 0, 1200)
+        };
+    }
+
+    async function readConfig() {
+        if (!configPromise) {
+            configPromise = (async () => {
+                try {
+                    if (gmGetValue) {
+                        const sanitized = sanitizeConfig(await gmGetValue(STORAGE_KEY, DEFAULT_CONFIG));
+                        debugEnabled = sanitized.debug;
+                        return sanitized;
+                    }
+
+                    const raw = pageWindow.localStorage && pageWindow.localStorage.getItem(STORAGE_KEY);
+                    const sanitized = sanitizeConfig(raw ? JSON.parse(raw) : DEFAULT_CONFIG);
+                    debugEnabled = sanitized.debug;
+                    return sanitized;
+                } catch (error) {
+                    safeNativeConsole('warn', 'Could not read saved config; using defaults.', error);
+                    const sanitized = sanitizeConfig(DEFAULT_CONFIG);
+                    debugEnabled = sanitized.debug;
+                    return sanitized;
+                }
+            })();
+        }
+
+        return configPromise;
+    }
+
+    async function writeConfig(nextConfig) {
+        const sanitized = sanitizeConfig(nextConfig);
+        configPromise = Promise.resolve(sanitized);
+        debugEnabled = sanitized.debug;
+
+        try {
+            if (gmSetValue) {
+                await gmSetValue(STORAGE_KEY, sanitized);
+            } else if (pageWindow.localStorage) {
+                pageWindow.localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitized));
+            }
+        } catch (error) {
+            safeNativeConsole('warn', 'Could not save config.', error);
+        }
+
+        return sanitized;
+    }
+
+    async function patchConfig(partial) {
+        const current = await readConfig();
+        return writeConfig({
+            ...current,
+            ...partial,
+            custom: {
+                ...current.custom,
+                ...(partial.custom || {})
+            },
+            fuzzy: {
+                ...current.fuzzy,
+                ...(partial.fuzzy || {})
+            }
+        });
+    }
+
+    function safeNativeConsole(method, ...args) {
+        if (!debugEnabled) {
+            return;
+        }
+
+        try {
+            if (pageWindow.console && typeof pageWindow.console[method] === 'function') {
+                pageWindow.console[method](`[${SCRIPT_NAME}]`, ...args);
+            }
+        } catch (_error) {
+            // Ignore console failures. The userscript must not break the page.
+        }
+    }
+
+    async function debugLog(...args) {
+        const config = await readConfig();
+        if (config.debug) {
+            safeNativeConsole('log', ...args);
+        }
+    }
+
+    function getBasePoint(config) {
+        if (config.preset === 'custom') {
+            return sanitizePoint(config.custom, PRESETS.custom);
+        }
+
+        return sanitizePoint(PRESETS[config.preset] || PRESETS.pacific, PRESETS.pacific);
+    }
+
+    function randomBetween(min, max) {
+        return min + Math.random() * (max - min);
+    }
+
+    function randomInt(min, max) {
+        return Math.floor(randomBetween(min, max + 1));
+    }
+
+    function randomPointNear(point, radiusMeters) {
+        const distance = radiusMeters * Math.sqrt(Math.random());
+        const bearing = Math.random() * Math.PI * 2;
+        const angularDistance = distance / EARTH_RADIUS_METERS;
+        const lat1 = point.latitude * Math.PI / 180;
+        const lon1 = point.longitude * Math.PI / 180;
+
+        const lat2 = Math.asin(
+            Math.sin(lat1) * Math.cos(angularDistance)
+            + Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing)
+        );
+        const lon2 = lon1 + Math.atan2(
+            Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+            Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
+        );
+
+        return {
+            ...point,
+            latitude: lat2 * 180 / Math.PI,
+            longitude: normalizeLongitude(lon2 * 180 / Math.PI, point.longitude),
+            accuracy: Math.max(point.accuracy, Math.round(randomBetween(Math.max(25, radiusMeters * 0.08), Math.max(35, radiusMeters * 0.2))))
+        };
+    }
+
+    function addTinyMobileJitter(point, mode) {
+        const jitterMeters = mode === 'fixed' ? 2 : 8;
+        const jittered = randomPointNear(point, jitterMeters);
+
+        return {
+            ...point,
+            latitude: Number(jittered.latitude.toFixed(7)),
+            longitude: Number(jittered.longitude.toFixed(7)),
+            accuracy: Math.max(5, Math.round(point.accuracy + randomBetween(-4, 8))),
+            altitude: point.altitude === null ? null : Number((point.altitude + randomBetween(-1.5, 1.5)).toFixed(1)),
+            altitudeAccuracy: point.altitudeAccuracy === null ? null : Math.max(1, Math.round(point.altitudeAccuracy + randomBetween(-2, 4))),
+            heading: point.heading === null ? null : normalizeNullableNumber(point.heading + randomBetween(-8, 8), null, 0, 360),
+            speed: point.speed === null ? null : Math.max(0, Number((point.speed + randomBetween(-0.15, 0.15)).toFixed(2)))
+        };
+    }
+
+    async function getFuzzyPoint(config) {
+        const basePoint = getBasePoint(config);
+        const cacheMs = config.fuzzy.cacheMinutes * 60 * 1000;
+        const cached = config.cachedFake;
+
+        if (
+            cached
+            && cached.preset === config.preset
+            && cached.radiusMeters === config.fuzzy.radiusMeters
+            && Date.now() - cached.createdAt <= cacheMs
+        ) {
+            return sanitizePoint(cached.position, basePoint);
+        }
+
+        const fuzzyPoint = randomPointNear(basePoint, config.fuzzy.radiusMeters);
+        await writeConfig({
+            ...config,
+            cachedFake: {
+                createdAt: Date.now(),
+                preset: config.preset,
+                radiusMeters: config.fuzzy.radiusMeters,
+                position: fuzzyPoint
+            }
+        });
+        return fuzzyPoint;
+    }
+
+    function makeCoords(point) {
+        const coords = {
+            latitude: point.latitude,
+            longitude: point.longitude,
+            accuracy: point.accuracy,
+            altitude: point.altitude,
+            altitudeAccuracy: point.altitudeAccuracy,
+            heading: point.heading,
+            speed: point.speed
+        };
+
+        try {
+            Object.defineProperty(coords, Symbol.toStringTag, { value: 'GeolocationCoordinates' });
+        } catch (_error) {
+            // Older userscript engines may not allow Symbol.toStringTag.
+        }
+
+        return coords;
+    }
+
+    function makePosition(point) {
+        const position = {
+            coords: makeCoords(point),
             timestamp: Date.now()
         };
-        return {
-            success: true,
-            position: noisy
-        };
+
+        try {
+            Object.defineProperty(position, Symbol.toStringTag, { value: 'GeolocationPosition' });
+        } catch (_error) {
+            // Older userscript engines may not allow Symbol.toStringTag.
+        }
+
+        return position;
     }
-    return new Promise((resolve)=>{
-        // we call getCurrentPosition here in the content script, instead of
-        // inside the page, because the content-script/page communication is not secure
-        //
-        getCurrentPosition.apply(navigator.geolocation, [
-            async function(position) {
-                // clone, modifying/sending the native object returns error
-                const noisy = await addNoise(klona(position));
-                resolve({
-                    success: true,
-                    position: noisy
-                });
-            },
-            function(error) {
-                resolve({
-                    success: false,
-                    position: klona(error)
-                }); // clone, sending the native object returns error
-            },
-            opt
-        ]);
-    });
-}
-// gets position, returs noisy version based on the privacy options
-//
-async function addNoise(position) {
-    const paused = await getStoredValueAsync('paused');
-    // TODO: per domain level
-    const level = await getStoredValueAsync('defaultLevel');
-    if (paused || level === 'real') ; else if (level === 'fixed') {
-        const fixedPos = await getStoredValueAsync('fixedPos');
-        position.coords = {
-            latitude: fixedPos.latitude,
-            longitude: fixedPos.longitude,
-            accuracy: 10,
-            altitude: isMobileDevice() ? randomInt(10, 100) : null,
-            altitudeAccuracy: isMobileDevice() ? 10 : null,
-            heading: isMobileDevice() ? randomInt(0, 360) : null,
-            speed: null
-        };
-    } else {
-        const cachedPos = await getStoredValueAsync('cachedPos');
-        const storedEpsilon = await getStoredValueAsync('epsilon');
-        const levels = await getStoredValueAsync('levels');
-        if ('level' in cachedPos && cachedPos[level] && (Date.now() - cachedPos[level].epoch) / 60000 < cachedPos[level].cacheTime) {
-            position = cachedPos[level].position;
-            console.log('using cached', position);
-        } else {
-            // add noise
-            const epsilon = storedEpsilon / levels[level].radius;
-            const noisy = PlanarLaplace.addNoise(epsilon, position.coords);
-            position.coords.latitude = noisy.latitude;
-            position.coords.longitude = noisy.longitude;
-            // update accuracy
-            if (position.coords.accuracy && await getStoredValueAsync('updateAccuracy')) {
-                position.coords.accuracy += Math.round(PlanarLaplace.alphaDeltaAccuracy(epsilon, .9));
+
+    async function makeProtectedPosition() {
+        const config = await readConfig();
+        const basePoint = config.mode === 'fuzzy' ? await getFuzzyPoint(config) : getBasePoint(config);
+        return makePosition(addTinyMobileJitter(basePoint, config.mode));
+    }
+
+    function shouldUseNative(config) {
+        return config.paused || config.mode === 'real';
+    }
+
+    function callAsync(callback, value) {
+        if (typeof callback !== 'function') return;
+
+        pageWindow.setTimeout(() => {
+            try {
+                callback(value);
+            } catch (error) {
+                safeNativeConsole('warn', 'Page geolocation callback threw an error.', error);
             }
-            // don't know how to add noise to those, so we set to null (they're most likely null anyway)
-            position.coords.altitude = null;
-            position.coords.altitudeAccuracy = null;
-            position.coords.heading = null;
-            position.coords.speed = null;
-            // cache
-            cachedPos[level] = {
-                epoch: Date.now(),
-                position,
-                cacheTime: levels[level].cacheTime
-            };
-            await setStoredValueAsync('cachedPos', cachedPos);
-            console.log('noisy coords', position.coords);
+        }, 0);
+    }
+
+    function callNativeGetCurrentPosition(successCallback, errorCallback, options) {
+        if (typeof nativeGetCurrentPosition === 'function') {
+            try {
+                return nativeGetCurrentPosition.call(nativeGeolocation, successCallback, errorCallback, options);
+            } catch (error) {
+                callAsync(errorCallback, makePositionError(2, error && error.message ? error.message : 'Native geolocation failed.'));
+                return undefined;
+            }
+        }
+
+        callAsync(errorCallback, makePositionError(2, 'Native geolocation is unavailable.'));
+        return undefined;
+    }
+
+    function makePositionError(code, message) {
+        const error = {
+            code,
+            message,
+            PERMISSION_DENIED: 1,
+            POSITION_UNAVAILABLE: 2,
+            TIMEOUT: 3
+        };
+
+        try {
+            Object.defineProperty(error, Symbol.toStringTag, { value: 'GeolocationPositionError' });
+        } catch (_error) {
+            // Ignore.
+        }
+
+        return error;
+    }
+
+    async function protectedGetCurrentPosition(successCallback, errorCallback, options) {
+        try {
+            const config = await readConfig();
+
+            if (shouldUseNative(config)) {
+                await debugLog('Passing getCurrentPosition through to native geolocation.');
+                return callNativeGetCurrentPosition(successCallback, errorCallback, options);
+            }
+
+            const position = await makeProtectedPosition();
+            await debugLog('Returning protected getCurrentPosition result.', position);
+            callAsync(successCallback, position);
+            return undefined;
+        } catch (error) {
+            safeNativeConsole('warn', 'Protected getCurrentPosition failed safely.', error);
+            callAsync(errorCallback, makePositionError(2, 'Protected geolocation failed safely.'));
+            return undefined;
         }
     }
-    // return noisy position
-    return position;
-}const renderConfigUI = async ()=>{
-    const $locationGuard = {
-        ready: true,
-        PlanarLaplace,
-        epsilon: await getStoredValueAsync('epsilon'),
-        emptyCachedPos () {
-            return setStoredValueAsync('cachedPos', {});
-        },
-        setValue: setStoredValueAsync,
-        getValue: getStoredValueAsync,
-        async resetConfig () {
-            const keys = Object.keys(DEFAULT_VALUE);
-            await Promise.all(keys.map((key)=>setStoredValueAsync(key, DEFAULT_VALUE[key])));
+
+    async function protectedWatchPosition(successCallback, errorCallback, options) {
+        try {
+            const config = await readConfig();
+
+            if (shouldUseNative(config) && typeof nativeWatchPosition === 'function') {
+                await debugLog('Passing watchPosition through to native geolocation.');
+                return nativeWatchPosition.call(nativeGeolocation, successCallback, errorCallback, options);
+            }
+
+            const watchId = nextWatchId++;
+            const intervalMs = Math.max(MIN_WATCH_INTERVAL_MS, toNumber(options && options.maximumAge, DEFAULT_WATCH_INTERVAL_MS));
+
+            const emit = async () => {
+                if (!virtualWatchers.has(watchId)) return;
+
+                try {
+                    // Keep existing virtual watches virtual until the page clears them.
+                    // If the user later switches to real mode, new watchPosition calls pass
+                    // through to native geolocation, but this avoids losing the watch id that
+                    // was already returned synchronously to the page.
+                    callAsync(successCallback, await makeProtectedPosition());
+                } catch (error) {
+                    safeNativeConsole('warn', 'Protected watchPosition update failed safely.', error);
+                    callAsync(errorCallback, makePositionError(2, 'Protected watchPosition update failed safely.'));
+                }
+            };
+
+            virtualWatchers.set(watchId, pageWindow.setInterval(emit, intervalMs));
+            emit();
+            await debugLog('Started protected watchPosition.', { watchId, intervalMs });
+            return watchId;
+        } catch (error) {
+            safeNativeConsole('warn', 'Protected watchPosition failed safely.', error);
+            callAsync(errorCallback, makePositionError(2, 'Protected watchPosition failed safely.'));
+            return 0;
         }
-    };
-    Object.defineProperty(unsafeWindow, '$locationGuard', {
-        value: $locationGuard,
-        enumerable: true,
-        writable: false
-    });
-    unsafeWindow.dispatchEvent(new CustomEvent('location-guard-config-ui-ready'));
-};(()=>{
-    spoofLocation();
-    if ('registerMenuCommand' in GM && typeof GM.registerMenuCommand === 'function') {
-        GM.registerMenuCommand('Configuration', ()=>{
-            const a = document.createElement('a');
-            a.href = 'https://location-guard-ng.skk.moe/options';
-            a.target = '_blank';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
+    }
+
+    function protectedClearWatch(watchId) {
+        try {
+            if (virtualWatchers.has(watchId)) {
+                pageWindow.clearInterval(virtualWatchers.get(watchId));
+                virtualWatchers.delete(watchId);
+                return;
+            }
+
+            if (typeof nativeClearWatch === 'function') {
+                nativeClearWatch.call(nativeGeolocation, watchId);
+            }
+        } catch (error) {
+            safeNativeConsole('warn', 'clearWatch failed safely.', error);
+        }
+    }
+
+    function replaceProperty(target, property, value) {
+        if (!target) return false;
+
+        try {
+            Object.defineProperty(target, property, {
+                value,
+                configurable: true,
+                writable: true
+            });
+            return true;
+        } catch (_error) {
+            try {
+                target[property] = value;
+                return true;
+            } catch (error) {
+                safeNativeConsole('warn', `Could not replace ${String(property)}.`, error);
+                return false;
+            }
+        }
+    }
+
+    function installGeolocationProtection() {
+        if (!nativeGeolocation) {
+            safeNativeConsole('warn', 'navigator.geolocation is unavailable; nothing to protect on this page.');
+            return;
+        }
+
+        replaceProperty(nativeGeolocation, 'getCurrentPosition', protectedGetCurrentPosition);
+        replaceProperty(nativeGeolocation, 'watchPosition', protectedWatchPosition);
+        replaceProperty(nativeGeolocation, 'clearWatch', protectedClearWatch);
+    }
+
+    function makePermissionStatus(state) {
+        const listeners = new Map();
+        const status = {
+            name: 'geolocation',
+            state,
+            onchange: null,
+            addEventListener(type, listener) {
+                if (!listeners.has(type)) listeners.set(type, new Set());
+                listeners.get(type).add(listener);
+            },
+            removeEventListener(type, listener) {
+                if (listeners.has(type)) listeners.get(type).delete(listener);
+            },
+            dispatchEvent(event) {
+                const type = event && event.type;
+                if (type && listeners.has(type)) {
+                    listeners.get(type).forEach((listener) => {
+                        try {
+                            listener.call(status, event);
+                        } catch (error) {
+                            safeNativeConsole('warn', 'Permission listener threw an error.', error);
+                        }
+                    });
+                }
+                if (type === 'change' && typeof status.onchange === 'function') {
+                    status.onchange.call(status, event);
+                }
+                return true;
+            }
+        };
+
+        try {
+            Object.defineProperty(status, Symbol.toStringTag, { value: 'PermissionStatus' });
+        } catch (_error) {
+            // Ignore.
+        }
+
+        return status;
+    }
+
+    function installPermissionsProtection() {
+        if (!nativePermissions || typeof nativePermissionsQuery !== 'function') {
+            return;
+        }
+
+        replaceProperty(nativePermissions, 'query', async function protectedPermissionsQuery(descriptor) {
+            try {
+                const name = descriptor && descriptor.name;
+                if (name === 'geolocation') {
+                    const config = await readConfig();
+                    if (!shouldUseNative(config)) {
+                        await debugLog('Returning protected geolocation permission state.', config.permissionState);
+                        return makePermissionStatus(config.permissionState);
+                    }
+                }
+
+                return nativePermissionsQuery.call(nativePermissions, descriptor);
+            } catch (error) {
+                safeNativeConsole('warn', 'permissions.query failed safely.', error);
+                try {
+                    return nativePermissionsQuery.call(nativePermissions, descriptor);
+                } catch (_nativeError) {
+                    return makePermissionStatus('prompt');
+                }
+            }
         });
     }
-    if (window.location.host === 'localhost:3000' || window.location.host === 'location-guard-ng.skk.moe') {
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', renderConfigUI);
-        } else {
-            renderConfigUI();
+
+    function registerMenu(label, handler) {
+        if (typeof gmRegisterMenuCommand !== 'function') return;
+
+        try {
+            gmRegisterMenuCommand(`${SCRIPT_NAME}: ${label}`, () => {
+                Promise.resolve(handler()).catch((error) => safeNativeConsole('warn', `Menu command failed: ${label}`, error));
+            });
+        } catch (error) {
+            safeNativeConsole('warn', `Could not register menu command: ${label}`, error);
         }
     }
-})();})();
+
+    async function setMode(mode) {
+        await patchConfig({ mode, paused: false });
+        await debugLog(`Mode changed to ${mode}.`);
+    }
+
+    async function setPreset(preset) {
+        if (!Object.prototype.hasOwnProperty.call(PRESETS, preset)) return;
+        await patchConfig({ preset, cachedFake: null });
+        await debugLog(`Preset changed to ${PRESETS[preset].label}.`);
+    }
+
+    async function clearCachedFakeLocation() {
+        await patchConfig({ cachedFake: null });
+        await debugLog('Cached fake location cleared.');
+    }
+
+    async function promptCustomLocation() {
+        const config = await readConfig();
+        const latitude = pageWindow.prompt('Custom fake latitude (-90 to 90):', String(config.custom.latitude));
+        if (latitude === null) return;
+
+        const longitude = pageWindow.prompt('Custom fake longitude (-180 to 180):', String(config.custom.longitude));
+        if (longitude === null) return;
+
+        const accuracy = pageWindow.prompt('Accuracy in meters (example: 50):', String(config.custom.accuracy));
+        if (accuracy === null) return;
+
+        await patchConfig({
+            preset: 'custom',
+            cachedFake: null,
+            custom: {
+                latitude: normalizeLatitude(latitude, config.custom.latitude),
+                longitude: normalizeLongitude(longitude, config.custom.longitude),
+                accuracy: normalizeNonNegative(accuracy, config.custom.accuracy, 100000)
+            }
+        });
+    }
+
+    function createButton(label, onClick) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.style.cssText = 'margin:4px;padding:8px 10px;border:1px solid #789;border-radius:8px;background:#f7fbff;color:#123;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+        button.addEventListener('click', () => {
+            Promise.resolve(onClick()).catch((error) => safeNativeConsole('warn', `Panel action failed: ${label}`, error));
+        });
+        return button;
+    }
+
+    function addLabel(container, text, input) {
+        const label = document.createElement('label');
+        label.style.cssText = 'display:block;margin:8px 0 4px;color:#123;font:13px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+        label.textContent = text;
+        container.appendChild(label);
+        container.appendChild(input);
+    }
+
+    function createInput(value, type) {
+        const input = document.createElement('input');
+        input.type = type || 'text';
+        input.value = String(value);
+        input.style.cssText = 'box-sizing:border-box;width:100%;padding:8px;border:1px solid #9ab;border-radius:8px;font:16px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+        return input;
+    }
+
+    function createSelect(options, value) {
+        const select = document.createElement('select');
+        select.value = value;
+        select.style.cssText = 'box-sizing:border-box;width:100%;padding:8px;border:1px solid #9ab;border-radius:8px;background:white;font:16px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+        options.forEach((option) => {
+            const element = document.createElement('option');
+            element.value = option.value;
+            element.textContent = option.label;
+            select.appendChild(element);
+        });
+        select.value = value;
+        return select;
+    }
+
+    async function openConfigPanel() {
+        if (!document.body) {
+            pageWindow.setTimeout(openConfigPanel, 50);
+            return;
+        }
+
+        if (panel) {
+            panel.remove();
+            panel = null;
+        }
+
+        const config = await readConfig();
+        panel = document.createElement('div');
+        panel.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.42);padding:18px;overflow:auto;';
+
+        const card = document.createElement('div');
+        card.style.cssText = 'max-width:460px;margin:20px auto;padding:16px;border-radius:14px;background:white;box-shadow:0 8px 40px rgba(0,0,0,.35);color:#123;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+        panel.appendChild(card);
+
+        const title = document.createElement('h2');
+        title.textContent = SCRIPT_NAME;
+        title.style.cssText = 'margin:0 0 8px;font-size:20px;color:#123;';
+        card.appendChild(title);
+
+        const warning = document.createElement('p');
+        warning.textContent = 'Protects navigator.geolocation only. It does not hide IP address, VPN status, timezone, accounts, cookies, browser fingerprint, or network-based location.';
+        warning.style.cssText = 'margin:0 0 12px;padding:8px;border-radius:8px;background:#fff4d6;color:#432;font-size:13px;line-height:1.35;';
+        card.appendChild(warning);
+
+        const modeSelect = createSelect([
+            { value: 'fixed', label: 'Fixed fake location' },
+            { value: 'fuzzy', label: 'Fuzzy/noisy fake location' },
+            { value: 'real', label: 'Real location mode' }
+        ], config.mode);
+        addLabel(card, 'Mode', modeSelect);
+
+        const presetSelect = createSelect(Object.keys(PRESETS).map((key) => ({ value: key, label: PRESETS[key].label })), config.preset);
+        addLabel(card, 'Preset', presetSelect);
+
+        const pausedSelect = createSelect([
+            { value: 'false', label: 'Protection active' },
+            { value: 'true', label: 'Paused - pass through real geolocation' }
+        ], String(config.paused));
+        addLabel(card, 'Pause protection', pausedSelect);
+
+        const latInput = createInput(config.custom.latitude, 'number');
+        const lonInput = createInput(config.custom.longitude, 'number');
+        const accuracyInput = createInput(config.custom.accuracy, 'number');
+        const radiusInput = createInput(config.fuzzy.radiusMeters, 'number');
+        const cacheInput = createInput(config.fuzzy.cacheMinutes, 'number');
+        const debugSelect = createSelect([
+            { value: 'false', label: 'Debug logs off' },
+            { value: 'true', label: 'Debug logs on' }
+        ], String(config.debug));
+
+        addLabel(card, 'Custom latitude', latInput);
+        addLabel(card, 'Custom longitude', lonInput);
+        addLabel(card, 'Custom accuracy (meters)', accuracyInput);
+        addLabel(card, 'Fuzzy radius (meters)', radiusInput);
+        addLabel(card, 'Fuzzy cache minutes', cacheInput);
+        addLabel(card, 'Debug logging', debugSelect);
+
+        const buttonRow = document.createElement('div');
+        buttonRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:12px;';
+        card.appendChild(buttonRow);
+
+        buttonRow.appendChild(createButton('Save', async () => {
+            await writeConfig({
+                ...config,
+                mode: modeSelect.value,
+                preset: presetSelect.value,
+                paused: pausedSelect.value === 'true',
+                debug: debugSelect.value === 'true',
+                cachedFake: null,
+                custom: {
+                    ...config.custom,
+                    latitude: normalizeLatitude(latInput.value, config.custom.latitude),
+                    longitude: normalizeLongitude(lonInput.value, config.custom.longitude),
+                    accuracy: normalizeNonNegative(accuracyInput.value, config.custom.accuracy, 100000)
+                },
+                fuzzy: {
+                    radiusMeters: normalizeNonNegative(radiusInput.value, config.fuzzy.radiusMeters, 1000000),
+                    cacheMinutes: normalizeNonNegative(cacheInput.value, config.fuzzy.cacheMinutes, 1440)
+                }
+            });
+            panel.remove();
+            panel = null;
+        }));
+        buttonRow.appendChild(createButton('Clear cached fake', clearCachedFakeLocation));
+        buttonRow.appendChild(createButton('Close', () => {
+            panel.remove();
+            panel = null;
+        }));
+
+        document.body.appendChild(panel);
+    }
+
+    function installMenus() {
+        registerMenu('Open configuration panel', openConfigPanel);
+        registerMenu('Real location mode', () => setMode('real'));
+        registerMenu('Fixed fake location mode', () => setMode('fixed'));
+        registerMenu('Fuzzy/noisy location mode', () => setMode('fuzzy'));
+        registerMenu('Pause protection', () => patchConfig({ paused: true }));
+        registerMenu('Resume protection', () => patchConfig({ paused: false }));
+        registerMenu('Clear cached fake location', clearCachedFakeLocation);
+        registerMenu('Preset: Pacific Ocean', () => setPreset('pacific'));
+        registerMenu('Preset: New York', () => setPreset('newYork'));
+        registerMenu('Preset: London', () => setPreset('london'));
+        registerMenu('Preset: Tokyo', () => setPreset('tokyo'));
+        registerMenu('Preset: Custom latitude/longitude', promptCustomLocation);
+        registerMenu('Toggle debug logging', async () => {
+            const config = await readConfig();
+            await patchConfig({ debug: !config.debug });
+        });
+    }
+
+    function exposeSafeConfigApi() {
+        const api = {
+            getConfig: readConfig,
+            setConfig: writeConfig,
+            clearCachedFakeLocation,
+            openConfigPanel,
+            presets: cloneJson(PRESETS),
+            limitation: 'This userscript protects navigator.geolocation only. It does not hide IP, VPN, timezone, browser fingerprint, accounts, cookies, or network-based location.'
+        };
+
+        try {
+            Object.defineProperty(pageWindow, '$mobileLocationPrivacyGuard', {
+                value: api,
+                configurable: true,
+                enumerable: false,
+                writable: false
+            });
+        } catch (_error) {
+            // Exposing the helper is optional.
+        }
+    }
+
+    installGeolocationProtection();
+    installPermissionsProtection();
+    installMenus();
+    exposeSafeConfigApi();
+})();
